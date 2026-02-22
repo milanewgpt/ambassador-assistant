@@ -5,7 +5,9 @@ Uses python-telegram-bot v20+ (async).
 
 import json
 import asyncio
-from datetime import timedelta
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from telegram import Update
@@ -20,7 +22,9 @@ from telegram.ext import (
 from app.config import settings
 from app.database import execute, fetch_all, fetch_one, fetch_val
 from app.services.scoring import score_post
+from app.services.classification import classify_post
 from app.utils.logging import log
+from importer.x_archive import extract_tweets_from_zip
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -340,6 +344,106 @@ async def cmd_score_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Scoring failed — check logs.")
 
 
+# ── ZIP archive upload handler ───────────────────────────────
+
+async def handle_archive_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Accept a ZIP file in chat, parse X archive, import all tweets."""
+    if not _authorized(update):
+        return await _deny(update)
+
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".zip"):
+        return await update.message.reply_text("Send a .zip file (X / Twitter data archive).")
+
+    status_msg = await update.message.reply_text("📥 Downloading archive …")
+
+    try:
+        tg_file = await ctx.bot.get_file(doc.file_id)
+
+        tmp_dir = tempfile.mkdtemp(prefix="amb_archive_")
+        zip_path = os.path.join(tmp_dir, doc.file_name)
+        await tg_file.download_to_drive(zip_path)
+
+        await status_msg.edit_text("📦 Extracting tweets …")
+
+        tweets = extract_tweets_from_zip(zip_path)
+        if not tweets:
+            return await status_msg.edit_text("❌ No tweets found in archive.")
+
+        handle = settings.MAIN_X_HANDLE.lstrip("@")
+        await status_msg.edit_text(f"⚙️ Importing {len(tweets)} tweets …")
+
+        inserted = 0
+        skipped = 0
+        classified = 0
+
+        for tw in tweets:
+            tweet_id = tw.get("id_str") or tw.get("id")
+            if not tweet_id:
+                continue
+
+            url = f"https://x.com/{handle}/status/{tweet_id}"
+            created_str = tw.get("created_at", "")
+            full_text = tw.get("full_text") or tw.get("text") or ""
+
+            try:
+                created_at = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+            except (ValueError, TypeError):
+                created_at = datetime.now(timezone.utc)
+
+            existing = await fetch_one("SELECT id FROM posts WHERE url = $1;", url)
+            if existing:
+                skipped += 1
+                continue
+
+            project_id = await classify_post(url, full_text)
+            if project_id:
+                classified += 1
+
+            row = await fetch_one(
+                """
+                INSERT INTO posts (source, url, created_at, text, project_id)
+                VALUES ('x_archive', $1, $2, $3, $4)
+                RETURNING id;
+                """,
+                url, created_at, full_text, project_id,
+            )
+
+            run_at = created_at + timedelta(hours=settings.SCORING_DELAY_HOURS)
+            if run_at < datetime.now(timezone.utc):
+                run_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+            await execute(
+                "INSERT INTO score_jobs (post_id, run_at, status) VALUES ($1, $2, 'scheduled');",
+                row["id"], run_at,
+            )
+            inserted += 1
+
+            if inserted % 100 == 0:
+                await status_msg.edit_text(f"⚙️ Imported {inserted} / {len(tweets)} …")
+
+        # cleanup temp file
+        try:
+            os.remove(zip_path)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+        await status_msg.edit_text(
+            f"✅ Import complete!\n\n"
+            f"📝 Inserted: {inserted}\n"
+            f"🔁 Skipped (duplicates): {skipped}\n"
+            f"🏷 Auto-classified: {classified}\n"
+            f"📊 Score jobs created: {inserted}\n\n"
+            f"Worker will start scoring in ~5 minutes."
+        )
+        log.info("Archive import via bot: %d inserted, %d skipped", inserted, skipped)
+
+    except Exception as exc:
+        log.error("Archive import failed: %s", exc)
+        await status_msg.edit_text(f"❌ Import failed: {exc}")
+
+
 # ── /start & /help ──────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -356,7 +460,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/feature &lt;url&gt; on|off\n"
         "/hide &lt;url&gt; on|off\n"
         "/metrics &lt;url&gt; likes replies reposts quotes [views]\n"
-        "/score_now &lt;url&gt; — force immediate scoring",
+        "/score_now &lt;url&gt; — force immediate scoring\n\n"
+        "📎 <b>Upload X archive:</b> send a .zip file directly to this chat",
         parse_mode="HTML",
     )
 
@@ -381,5 +486,6 @@ def build_bot_app() -> Application:
     app.add_handler(CommandHandler("hide", cmd_hide))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("score_now", cmd_score_now))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_archive_upload))
 
     return app
