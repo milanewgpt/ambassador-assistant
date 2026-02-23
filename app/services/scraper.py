@@ -100,6 +100,59 @@ async def _extract_from_spans(page) -> ScrapedMetrics | None:
     return None
 
 
+async def scrape_post_text(url: str) -> str | None:
+    """
+    Open a tweet URL in headless Chromium and extract the tweet text.
+    Returns the text or None on failure.
+    """
+    log.info("Scraping text for: %s", url)
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=_METRICS_TIMEOUT_MS)
+            await page.wait_for_timeout(4000)
+
+            text = None
+            try:
+                el = page.locator('[data-testid="tweetText"]').first
+                text = await el.inner_text(timeout=5000)
+            except Exception:
+                pass
+
+            if not text:
+                try:
+                    el = page.locator('article div[lang]').first
+                    text = await el.inner_text(timeout=3000)
+                except Exception:
+                    pass
+
+            await browser.close()
+
+            if text and len(text.strip()) > 5:
+                log.info("Scraped text (%d chars) for %s", len(text), url)
+                return text.strip()
+            else:
+                log.warning("Could not extract text from %s", url)
+                return None
+
+    except PwTimeout:
+        log.warning("Timeout scraping text for %s", url)
+        return None
+    except Exception as exc:
+        log.error("Text scraper error for %s: %s", url, exc)
+        return None
+
+
 async def scrape_post_metrics(url: str) -> ScrapedMetrics | None:
     """
     Open a tweet URL in headless Chromium and scrape engagement metrics.

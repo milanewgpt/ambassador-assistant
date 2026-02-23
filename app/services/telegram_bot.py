@@ -24,6 +24,7 @@ from app.config import settings
 from app.database import execute, fetch_all, fetch_one, fetch_val
 from app.services.scoring import score_post
 from app.services.classification import classify_post
+from app.services.scraper import scrape_post_text
 from app.utils.logging import log
 from importer.x_archive import extract_tweets_from_zip
 
@@ -489,7 +490,11 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     published_at = tweet_id_to_datetime(int(tweet_id_str))
-    project_id = await classify_post(url, text)
+
+    await update.message.reply_text("⏳ Fetching tweet text…")
+    tweet_text = await scrape_post_text(url)
+
+    project_id = await classify_post(url, tweet_text)
 
     row = await fetch_one(
         """
@@ -499,7 +504,7 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """,
         url,
         published_at,
-        None,
+        tweet_text,
         project_id,
     )
 
@@ -559,10 +564,23 @@ async def cmd_reclassify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     classified = 0
+    scraped = 0
     created_projects = set()
 
-    for r in rows:
-        project_id = await classify_post(r["url"], r["text"])
+    for i, r in enumerate(rows):
+        post_text = r["text"]
+
+        if not post_text or len(post_text.strip()) < 10:
+            tweet_text = await scrape_post_text(r["url"])
+            if tweet_text:
+                await execute(
+                    "UPDATE posts SET text = $1 WHERE id = $2;",
+                    tweet_text, r["id"],
+                )
+                post_text = tweet_text
+                scraped += 1
+
+        project_id = await classify_post(r["url"], post_text)
         if project_id:
             await execute(
                 "UPDATE posts SET project_id = $1 WHERE id = $2;",
@@ -574,18 +592,19 @@ async def cmd_reclassify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if proj:
                 created_projects.add(proj["name"])
 
-        if classified % 20 == 0 and classified > 0:
-            await msg.edit_text(f"⚙️ Classified {classified} / {count} …")
+        if (i + 1) % 5 == 0:
+            await msg.edit_text(f"⚙️ Processing {i + 1} / {count} (classified: {classified}) …")
 
     projects_list = ", ".join(sorted(created_projects)) if created_projects else "none"
     await msg.edit_text(
         f"✅ Reclassification done!\n\n"
         f"📝 Total unlinked: {count}\n"
+        f"🔍 Texts scraped: {scraped}\n"
         f"🏷 Classified: {classified}\n"
         f"❓ Still unlinked: {count - classified}\n"
         f"📁 Projects used: {projects_list}"
     )
-    log.info("Reclassify: %d/%d classified, projects: %s", classified, count, projects_list)
+    log.info("Reclassify: %d/%d classified, %d scraped, projects: %s", classified, count, scraped, projects_list)
 
 
 # ── /start & /help ──────────────────────────────────────────
