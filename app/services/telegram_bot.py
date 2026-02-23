@@ -451,6 +451,14 @@ _X_URL_RE = re.compile(
     r'https?://(?:x\.com|twitter\.com)/(\w+)/status/(\d+)'
 )
 
+TWITTER_EPOCH_MS = 1288834974657
+
+
+def tweet_id_to_datetime(tweet_id: int) -> datetime:
+    """Extract publication timestamp from a Twitter snowflake ID."""
+    timestamp_ms = (tweet_id >> 22) + TWITTER_EPOCH_MS
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+
 
 async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """User sends a tweet URL — validate, deduplicate, store, schedule scoring."""
@@ -463,10 +471,10 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     handle_in_url = match.group(1).lower()
-    tweet_id = match.group(2)
+    tweet_id_str = match.group(2)
     expected_handle = settings.MAIN_X_HANDLE.lower().lstrip("@")
 
-    url = f"https://x.com/{handle_in_url}/status/{tweet_id}"
+    url = f"https://x.com/{handle_in_url}/status/{tweet_id_str}"
 
     if handle_in_url != expected_handle:
         return await update.message.reply_text(
@@ -480,22 +488,27 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"ℹ️ This post is already in the database.\n{url}"
         )
 
+    published_at = tweet_id_to_datetime(int(tweet_id_str))
     project_id = await classify_post(url, text)
 
     row = await fetch_one(
         """
         INSERT INTO posts (source, url, created_at, text, project_id)
         VALUES ('x_relay', $1, $2, $3, $4)
-        RETURNING id, created_at;
+        RETURNING id;
         """,
         url,
-        datetime.now(timezone.utc),
+        published_at,
         None,
         project_id,
     )
 
     post_id = row["id"]
-    run_at = row["created_at"] + timedelta(hours=settings.SCORING_DELAY_HOURS)
+    run_at = published_at + timedelta(hours=settings.SCORING_DELAY_HOURS)
+    now = datetime.now(timezone.utc)
+    if run_at < now:
+        run_at = now + timedelta(minutes=5)
+
     await execute(
         "INSERT INTO score_jobs (post_id, run_at, status) VALUES ($1, $2, 'scheduled');",
         post_id,
@@ -508,12 +521,21 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if proj:
             project_label = f"\n🏷 Project: {proj['name']}"
 
+    age = now - published_at
+    age_str = f"{age.days}d {age.seconds // 3600}h ago" if age.days else f"{age.seconds // 3600}h {(age.seconds % 3600) // 60}m ago"
+
+    if run_at <= now + timedelta(minutes=10):
+        schedule_str = "~5 minutes (post is older than 48h)"
+    else:
+        schedule_str = f"{run_at.strftime('%Y-%m-%d %H:%M')} UTC"
+
     await update.message.reply_text(
         f"✅ Post added!\n"
-        f"{url}{project_label}\n"
-        f"📊 Scoring scheduled for {run_at.strftime('%Y-%m-%d %H:%M')} UTC"
+        f"{url}\n"
+        f"📅 Published: {published_at.strftime('%Y-%m-%d %H:%M')} UTC ({age_str}){project_label}\n"
+        f"📊 Scoring in: {schedule_str}"
     )
-    log.info("Post added via Telegram: %s", url)
+    log.info("Post added via Telegram: %s (published %s)", url, published_at.isoformat())
 
 
 # ── /start & /help ──────────────────────────────────────────
