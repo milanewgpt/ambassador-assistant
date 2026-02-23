@@ -149,7 +149,7 @@ async def process_due_jobs():
         FROM score_jobs sj
         JOIN posts p ON p.id = sj.post_id
         WHERE sj.status = 'waiting_metrics'
-          AND sj.run_at <= $1 - interval '4 hours';
+          AND sj.run_at <= ($1::timestamptz - interval '4 hours');
         """,
         now,
     )
