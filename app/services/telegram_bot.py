@@ -538,6 +538,56 @@ async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.info("Post added via Telegram: %s (published %s)", url, published_at.isoformat())
 
 
+# ── /reclassify — re-run classification on unlinked posts ────
+
+async def cmd_reclassify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return await _deny(update)
+
+    count = await fetch_val(
+        "SELECT count(*) FROM posts WHERE project_id IS NULL;"
+    )
+    if not count:
+        return await update.message.reply_text("All posts are already classified.")
+
+    msg = await update.message.reply_text(
+        f"⚙️ Re-classifying {count} unlinked posts …"
+    )
+
+    rows = await fetch_all(
+        "SELECT id, url, text FROM posts WHERE project_id IS NULL ORDER BY created_at DESC;"
+    )
+
+    classified = 0
+    created_projects = set()
+
+    for r in rows:
+        project_id = await classify_post(r["url"], r["text"])
+        if project_id:
+            await execute(
+                "UPDATE posts SET project_id = $1 WHERE id = $2;",
+                project_id, r["id"],
+            )
+            classified += 1
+
+            proj = await fetch_one("SELECT name FROM projects WHERE id = $1;", project_id)
+            if proj:
+                created_projects.add(proj["name"])
+
+        if classified % 20 == 0 and classified > 0:
+            await msg.edit_text(f"⚙️ Classified {classified} / {count} …")
+
+    projects_list = ", ".join(sorted(created_projects)) if created_projects else "none"
+    await msg.edit_text(
+        f"✅ Reclassification done!\n\n"
+        f"📝 Total unlinked: {count}\n"
+        f"🏷 Classified: {classified}\n"
+        f"❓ Still unlinked: {count - classified}\n"
+        f"📁 Projects used: {projects_list}"
+    )
+    log.info("Reclassify: %d/%d classified, projects: %s", classified, count, projects_list)
+
+
 # ── /start & /help ──────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -554,7 +604,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/feature &lt;url&gt; on|off\n"
         "/hide &lt;url&gt; on|off\n"
         "/metrics &lt;url&gt; likes replies reposts quotes [views]\n"
-        "/score_now &lt;url&gt; — force immediate scoring\n\n"
+        "/score_now &lt;url&gt; — force immediate scoring\n"
+        "/reclassify — auto-classify unlinked posts\n\n"
         "🔗 <b>Add post:</b> send an x.com/…/status/… link\n"
         "📎 <b>Import archive:</b> send a .zip file",
         parse_mode="HTML",
@@ -581,6 +632,7 @@ def build_bot_app() -> Application:
     app.add_handler(CommandHandler("hide", cmd_hide))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("score_now", cmd_score_now))
+    app.add_handler(CommandHandler("reclassify", cmd_reclassify))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_archive_upload))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_post_url
