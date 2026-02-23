@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from app.config import settings
 from app.database import get_pool, close_pool, fetch_all, fetch_one, execute
 from app.services.scoring import score_post
+from app.services.scraper import scrape_post_metrics
 from app.services.notifications import send_telegram
 from app.utils.logging import setup_logging
 
@@ -29,19 +30,43 @@ def _shutdown(sig, frame):
     RUNNING = False
 
 
+async def _try_scrape_and_save(post_id, url: str) -> bool:
+    """Attempt to scrape metrics via headless browser. Returns True if saved."""
+    try:
+        metrics = await scrape_post_metrics(url)
+        if metrics and (metrics.likes or metrics.replies or metrics.reposts or metrics.views):
+            await execute(
+                """
+                INSERT INTO metrics_snapshots (post_id, likes, replies, reposts, quotes, views)
+                VALUES ($1, $2, $3, $4, $5, $6);
+                """,
+                post_id,
+                metrics.likes,
+                metrics.replies,
+                metrics.reposts,
+                metrics.quotes,
+                metrics.views,
+            )
+            log.info("Auto-scraped metrics for %s: L=%d R=%d RP=%d V=%d",
+                     url, metrics.likes, metrics.replies, metrics.reposts, metrics.views)
+            return True
+    except Exception as exc:
+        log.warning("Scrape failed for %s: %s", url, exc)
+    return False
+
+
 async def process_due_jobs():
     """Find and execute all score_jobs that are due."""
     now = datetime.now(timezone.utc)
 
-    # 1) Handle scheduled jobs whose run_at has passed
     due = await fetch_all(
         """
-        SELECT sj.id, sj.post_id, sj.attempts, p.url
+        SELECT sj.id, sj.post_id, sj.attempts, p.url, p.source
         FROM score_jobs sj
         JOIN posts p ON p.id = sj.post_id
         WHERE sj.status = 'scheduled' AND sj.run_at <= $1
         ORDER BY sj.run_at
-        LIMIT 20;
+        LIMIT 10;
         """,
         now,
     )
@@ -49,33 +74,47 @@ async def process_due_jobs():
     for job in due:
         job_id = job["id"]
         post_id = job["post_id"]
+        post_url = job["url"]
+        source = job["source"]
         attempts = job["attempts"] + 1
+        is_archive = source == "x_archive"
 
-        log.info("Processing job %s for post %s (attempt %d)", job_id, post_id, attempts)
+        log.info("Processing job %s for %s (attempt %d, source=%s)",
+                 job_id, post_url, attempts, source)
         await execute(
             "UPDATE score_jobs SET status = 'running', attempts = $1 WHERE id = $2;",
-            attempts,
-            job_id,
+            attempts, job_id,
         )
 
-        # Check if metrics exist
         has_metrics = await fetch_one(
             "SELECT id FROM metrics_snapshots WHERE post_id = $1 LIMIT 1;",
             post_id,
         )
 
-        if not has_metrics and settings.METRICS_MODE == "manual":
-            log.info("No metrics for post %s — requesting via Telegram.", post_id)
-            await send_telegram(
-                f"📊 Metrics needed for scoring:\n{job['url']}\n\n"
-                f"Reply with:\n/metrics {job['url']} <likes> <replies> <reposts> <quotes> [views]"
-            )
-            await execute(
-                "UPDATE score_jobs SET status = 'waiting_metrics' WHERE id = $1;",
-                job_id,
-            )
-            continue
+        if not has_metrics:
+            scraped = await _try_scrape_and_save(post_id, post_url)
+            has_metrics = scraped
 
+        # Decide what to do if still no metrics
+        if not has_metrics:
+            if is_archive:
+                # Archive posts: score without metrics, don't bother the user
+                log.info("Archive post %s — scoring without metrics.", post_url)
+            else:
+                # New posts: ask user via Telegram, wait for manual entry
+                log.info("No metrics for new post %s — asking user.", post_url)
+                await send_telegram(
+                    f"📊 Could not auto-scrape metrics for:\n{post_url}\n\n"
+                    f"Please reply with:\n"
+                    f"/metrics {post_url} <likes> <replies> <reposts> <quotes> [views]"
+                )
+                await execute(
+                    "UPDATE score_jobs SET status = 'waiting_metrics' WHERE id = $1;",
+                    job_id,
+                )
+                continue
+
+        # Run LLM scoring
         try:
             ok = await score_post(post_id)
             if ok:
@@ -83,7 +122,7 @@ async def process_due_jobs():
                     "UPDATE score_jobs SET status = 'done' WHERE id = $1;",
                     job_id,
                 )
-                log.info("Job %s completed successfully.", job_id)
+                log.info("Job %s completed.", job_id)
             else:
                 raise RuntimeError("score_post returned False")
         except Exception as exc:
@@ -93,21 +132,20 @@ async def process_due_jobs():
             if attempts >= MAX_ATTEMPTS:
                 await execute(
                     "UPDATE score_jobs SET status = 'failed', last_error = $1 WHERE id = $2;",
-                    error_msg,
-                    job_id,
+                    error_msg, job_id,
                 )
-                await send_telegram(f"❌ Scoring failed after {MAX_ATTEMPTS} attempts:\n{job['url']}")
+                if not is_archive:
+                    await send_telegram(f"❌ Scoring failed after {MAX_ATTEMPTS} attempts:\n{post_url}")
             else:
                 await execute(
                     "UPDATE score_jobs SET status = 'scheduled', last_error = $1 WHERE id = $2;",
-                    error_msg,
-                    job_id,
+                    error_msg, job_id,
                 )
 
-    # 2) Nudge waiting_metrics jobs that have been waiting > 4 hours
+    # Nudge waiting_metrics jobs older than 4 hours
     stale = await fetch_all(
         """
-        SELECT sj.id, p.url, sj.attempts
+        SELECT sj.id, p.url
         FROM score_jobs sj
         JOIN posts p ON p.id = sj.post_id
         WHERE sj.status = 'waiting_metrics'
