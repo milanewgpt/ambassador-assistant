@@ -3,8 +3,10 @@ Ingest endpoints — called by PAD relay flows.
 Protected by X-Shared-Secret header.
 """
 
-from datetime import timedelta
-from fastapi import APIRouter, Header, HTTPException
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+from fastapi import APIRouter, Header, HTTPException, UploadFile, File
 
 from app.config import settings
 from app.database import execute, fetch_one
@@ -114,3 +116,97 @@ async def ingest_x(
 
     log.info("Post stored, score job scheduled for %s", run_at.isoformat())
     return OkResponse(detail="stored")
+
+
+# ── Archive upload (large files, bypasses Telegram 20MB limit) ──
+
+@router.post("/archive")
+async def ingest_archive(
+    file: UploadFile = File(...),
+    x_shared_secret: str | None = Header(None),
+):
+    _check_secret(x_shared_secret)
+
+    fname = (file.filename or "").lower()
+    if not (fname.endswith(".zip") or fname.endswith(".js")):
+        raise HTTPException(400, "Upload a .zip archive or tweets.js file")
+
+    tmp_dir = tempfile.mkdtemp(prefix="amb_archive_")
+    file_path = os.path.join(tmp_dir, file.filename)
+
+    with open(file_path, "wb") as f:
+        while chunk := await file.read(1024 * 1024):
+            f.write(chunk)
+
+    log.info("Archive uploaded: %s (%.1f MB)", file.filename, os.path.getsize(file_path) / 1e6)
+
+    from importer.x_archive import extract_tweets_from_zip, parse_tweets_js
+
+    if fname.endswith(".js"):
+        raw = open(file_path, "r", encoding="utf-8").read()
+        parsed = parse_tweets_js(raw)
+        tweets = [entry.get("tweet", entry) for entry in parsed]
+    else:
+        tweets = extract_tweets_from_zip(file_path)
+
+    if not tweets:
+        raise HTTPException(400, "No tweets found in the file")
+
+    handle = settings.MAIN_X_HANDLE.lstrip("@")
+    inserted = 0
+    skipped = 0
+    classified = 0
+
+    for tw in tweets:
+        tweet_id = tw.get("id_str") or tw.get("id")
+        if not tweet_id:
+            continue
+
+        url = f"https://x.com/{handle}/status/{tweet_id}"
+        created_str = tw.get("created_at", "")
+        full_text = tw.get("full_text") or tw.get("text") or ""
+
+        try:
+            created_at = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+        except (ValueError, TypeError):
+            created_at = datetime.now(timezone.utc)
+
+        existing = await fetch_one("SELECT id FROM posts WHERE url = $1;", url)
+        if existing:
+            skipped += 1
+            continue
+
+        project_id = await classify_post(url, full_text)
+        if project_id:
+            classified += 1
+
+        row = await fetch_one(
+            """
+            INSERT INTO posts (source, url, created_at, text, project_id)
+            VALUES ('x_archive', $1, $2, $3, $4)
+            RETURNING id;
+            """,
+            url, created_at, full_text, project_id,
+        )
+
+        run_at = created_at + timedelta(hours=settings.SCORING_DELAY_HOURS)
+        if run_at < datetime.now(timezone.utc):
+            run_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        await execute(
+            "INSERT INTO score_jobs (post_id, run_at, status) VALUES ($1, $2, 'scheduled');",
+            row["id"], run_at,
+        )
+        inserted += 1
+
+    try:
+        os.remove(file_path)
+        os.rmdir(tmp_dir)
+    except OSError:
+        pass
+
+    msg = f"Archive: {inserted} inserted, {skipped} duplicates, {classified} classified"
+    log.info(msg)
+    await send_telegram(f"📦 {msg}")
+
+    return {"inserted": inserted, "skipped": skipped, "classified": classified}

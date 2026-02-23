@@ -349,28 +349,39 @@ async def cmd_score_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── ZIP archive upload handler ───────────────────────────────
 
 async def handle_archive_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Accept a ZIP file in chat, parse X archive, import all tweets."""
+    """Accept a ZIP or .js file in chat, parse X archive, import all tweets."""
     if not _authorized(update):
         return await _deny(update)
 
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".zip"):
-        return await update.message.reply_text("Send a .zip file (X / Twitter data archive).")
+    fname = (doc.file_name or "").lower()
 
-    status_msg = await update.message.reply_text("📥 Downloading archive …")
+    if not (fname.endswith(".zip") or fname.endswith(".js")):
+        return await update.message.reply_text(
+            "Send a .zip archive or tweets.js file from your X / Twitter data export."
+        )
+
+    status_msg = await update.message.reply_text("📥 Downloading file …")
 
     try:
         tg_file = await ctx.bot.get_file(doc.file_id)
 
         tmp_dir = tempfile.mkdtemp(prefix="amb_archive_")
-        zip_path = os.path.join(tmp_dir, doc.file_name)
-        await tg_file.download_to_drive(zip_path)
+        file_path = os.path.join(tmp_dir, doc.file_name)
+        await tg_file.download_to_drive(file_path)
 
         await status_msg.edit_text("📦 Extracting tweets …")
 
-        tweets = extract_tweets_from_zip(zip_path)
+        if fname.endswith(".js"):
+            from importer.x_archive import parse_tweets_js
+            raw = open(file_path, "r", encoding="utf-8").read()
+            parsed = parse_tweets_js(raw)
+            tweets = [entry.get("tweet", entry) for entry in parsed]
+        else:
+            tweets = extract_tweets_from_zip(file_path)
+
         if not tweets:
-            return await status_msg.edit_text("❌ No tweets found in archive.")
+            return await status_msg.edit_text("❌ No tweets found in the file.")
 
         handle = settings.MAIN_X_HANDLE.lstrip("@")
         await status_msg.edit_text(f"⚙️ Importing {len(tweets)} tweets …")
@@ -424,9 +435,8 @@ async def handle_archive_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if inserted % 100 == 0:
                 await status_msg.edit_text(f"⚙️ Imported {inserted} / {len(tweets)} …")
 
-        # cleanup temp file
         try:
-            os.remove(zip_path)
+            os.remove(file_path)
             os.rmdir(tmp_dir)
         except OSError:
             pass
@@ -626,7 +636,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/score_now &lt;url&gt; — force immediate scoring\n"
         "/reclassify — auto-classify unlinked posts\n\n"
         "🔗 <b>Add post:</b> send an x.com/…/status/… link\n"
-        "📎 <b>Import archive:</b> send a .zip file",
+        "📎 <b>Import archive:</b> send tweets.js or .zip (&lt;20MB)\n"
+        "📎 <b>Large archive:</b> use curl (see below)",
         parse_mode="HTML",
     )
 
