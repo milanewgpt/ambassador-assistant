@@ -6,6 +6,7 @@ Uses python-telegram-bot v20+ (async).
 import json
 import asyncio
 import os
+import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -444,6 +445,77 @@ async def handle_archive_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Import failed: {exc}")
 
 
+# ── Post URL handler (plain text message with x.com link) ───
+
+_X_URL_RE = re.compile(
+    r'https?://(?:x\.com|twitter\.com)/(\w+)/status/(\d+)'
+)
+
+
+async def handle_post_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User sends a tweet URL — validate, deduplicate, store, schedule scoring."""
+    if not _authorized(update):
+        return await _deny(update)
+
+    text = update.message.text or ""
+    match = _X_URL_RE.search(text)
+    if not match:
+        return
+
+    handle_in_url = match.group(1).lower()
+    tweet_id = match.group(2)
+    expected_handle = settings.MAIN_X_HANDLE.lower().lstrip("@")
+
+    url = f"https://x.com/{handle_in_url}/status/{tweet_id}"
+
+    if handle_in_url != expected_handle:
+        return await update.message.reply_text(
+            f"⛔ This post belongs to @{handle_in_url}, not @{expected_handle}.\n"
+            f"Only your own posts can be added."
+        )
+
+    existing = await fetch_one("SELECT id FROM posts WHERE url = $1;", url)
+    if existing:
+        return await update.message.reply_text(
+            f"ℹ️ This post is already in the database.\n{url}"
+        )
+
+    project_id = await classify_post(url, text)
+
+    row = await fetch_one(
+        """
+        INSERT INTO posts (source, url, created_at, text, project_id)
+        VALUES ('x_relay', $1, $2, $3, $4)
+        RETURNING id, created_at;
+        """,
+        url,
+        datetime.now(timezone.utc),
+        None,
+        project_id,
+    )
+
+    post_id = row["id"]
+    run_at = row["created_at"] + timedelta(hours=settings.SCORING_DELAY_HOURS)
+    await execute(
+        "INSERT INTO score_jobs (post_id, run_at, status) VALUES ($1, $2, 'scheduled');",
+        post_id,
+        run_at,
+    )
+
+    project_label = ""
+    if project_id:
+        proj = await fetch_one("SELECT name FROM projects WHERE id = $1;", project_id)
+        if proj:
+            project_label = f"\n🏷 Project: {proj['name']}"
+
+    await update.message.reply_text(
+        f"✅ Post added!\n"
+        f"{url}{project_label}\n"
+        f"📊 Scoring scheduled for {run_at.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+    log.info("Post added via Telegram: %s", url)
+
+
 # ── /start & /help ──────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -461,7 +533,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/hide &lt;url&gt; on|off\n"
         "/metrics &lt;url&gt; likes replies reposts quotes [views]\n"
         "/score_now &lt;url&gt; — force immediate scoring\n\n"
-        "📎 <b>Upload X archive:</b> send a .zip file directly to this chat",
+        "🔗 <b>Add post:</b> send an x.com/…/status/… link\n"
+        "📎 <b>Import archive:</b> send a .zip file",
         parse_mode="HTML",
     )
 
@@ -487,5 +560,8 @@ def build_bot_app() -> Application:
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("score_now", cmd_score_now))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_archive_upload))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_post_url
+    ))
 
     return app
