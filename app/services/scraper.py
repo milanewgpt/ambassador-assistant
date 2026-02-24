@@ -3,12 +3,29 @@ Headless browser scraper for X/Twitter post metrics.
 Uses Playwright (Chromium) — no API, no login required for public posts.
 """
 
+import asyncio
+import os
 import re
+import time
 from dataclasses import dataclass
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 from app.utils.logging import log
 
 _METRICS_TIMEOUT_MS = 15_000
+_SCRAPER_MAX_CONCURRENCY = int(os.getenv("SCRAPER_MAX_CONCURRENCY", "2"))
+
+# Keeping a single Chromium instance per process dramatically reduces:
+# - CPU spikes from repeated browser launches
+# - child process churn
+# - risk of accumulating zombie processes if PID 1 doesn't reap correctly
+#
+# Concurrency is still capped to avoid overload when multiple Telegram commands
+# trigger scraping at once.
+_pw = None
+_browser = None
+_init_lock = asyncio.Lock()
+_sem = asyncio.Semaphore(_SCRAPER_MAX_CONCURRENCY)
+_last_used_at = 0.0
 
 
 @dataclass
@@ -35,6 +52,79 @@ def _parse_count(text: str) -> int:
     elif suffix == "M":
         num *= 1_000_000
     return int(num)
+
+
+async def _ensure_browser():
+    """Start Playwright + Chromium once and reuse across calls."""
+    global _pw, _browser, _last_used_at
+    async with _init_lock:
+        if _browser is not None:
+            try:
+                if _browser.is_connected():
+                    _last_used_at = time.time()
+                    return
+            except Exception:
+                # Fall through to recreate
+                pass
+
+        # Best-effort cleanup if a previous instance exists but is broken
+        try:
+            if _browser is not None:
+                await _browser.close()
+        except Exception:
+            pass
+        _browser = None
+
+        if _pw is None:
+            _pw = await async_playwright().start()
+
+        _browser = await _pw.chromium.launch(headless=True)
+        _last_used_at = time.time()
+
+
+async def shutdown_scraper():
+    """Close Chromium/Playwright (call on process shutdown)."""
+    global _pw, _browser
+    async with _init_lock:
+        try:
+            if _browser is not None:
+                await _browser.close()
+        finally:
+            _browser = None
+
+        try:
+            if _pw is not None:
+                await _pw.stop()
+        finally:
+            _pw = None
+
+
+async def _run_in_page(url: str, fn):
+    """
+    Run a scraping function in an isolated context+page, reusing a single Chromium instance.
+    `fn(page)` should return a value.
+    """
+    await _ensure_browser()
+
+    async with _sem:
+        context = await _browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
+        page = await context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=_METRICS_TIMEOUT_MS)
+            return await fn(page)
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 
 async def _extract_from_aria(page) -> ScrapedMetrics | None:
@@ -107,19 +197,7 @@ async def scrape_post_text(url: str) -> str | None:
     """
     log.info("Scraping text for: %s", url)
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-            )
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=_METRICS_TIMEOUT_MS)
+        async def _fn(page):
             await page.wait_for_timeout(4000)
 
             text = None
@@ -136,14 +214,14 @@ async def scrape_post_text(url: str) -> str | None:
                 except Exception:
                     pass
 
-            await browser.close()
-
             if text and len(text.strip()) > 5:
                 log.info("Scraped text (%d chars) for %s", len(text), url)
                 return text.strip()
             else:
                 log.warning("Could not extract text from %s", url)
                 return None
+
+        return await _run_in_page(url, _fn)
 
     except PwTimeout:
         log.warning("Timeout scraping text for %s", url)
@@ -161,33 +239,17 @@ async def scrape_post_metrics(url: str) -> ScrapedMetrics | None:
     log.info("Scraping metrics for: %s", url)
 
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-            )
-            page = await context.new_page()
-
-            await page.goto(url, wait_until="domcontentloaded", timeout=_METRICS_TIMEOUT_MS)
+        async def _fn(page):
             await page.wait_for_timeout(5000)
 
             # Check for login wall
             if await page.locator('text="Sign in"').count() > 3:
                 log.warning("Login wall detected for %s", url)
-                await browser.close()
                 return None
 
             metrics = await _extract_from_aria(page)
             if not metrics:
                 metrics = await _extract_from_spans(page)
-
-            await browser.close()
 
             if metrics:
                 log.info(
@@ -198,6 +260,8 @@ async def scrape_post_metrics(url: str) -> ScrapedMetrics | None:
                 log.warning("Could not extract metrics from %s", url)
 
             return metrics
+
+        return await _run_in_page(url, _fn)
 
     except PwTimeout:
         log.warning("Timeout scraping %s", url)

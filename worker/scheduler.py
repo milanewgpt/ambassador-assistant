@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from app.config import settings
 from app.database import get_pool, close_pool, fetch_all, fetch_one, execute
 from app.services.scoring import score_post
-from app.services.scraper import scrape_post_metrics
+from app.services.scraper import scrape_post_metrics, shutdown_scraper
 from app.services.notifications import send_telegram
 from app.utils.logging import setup_logging
 
@@ -176,6 +176,7 @@ async def main_loop():
             await asyncio.sleep(1)
 
     await close_pool()
+    await shutdown_scraper()
     log.info("Worker stopped.")
 
 

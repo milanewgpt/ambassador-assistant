@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.database import get_pool, close_pool
 from app.routers import health, ingest
+from app.services.scraper import shutdown_scraper
 from app.services.telegram_bot import build_bot_app
 from app.utils.logging import log
 
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
         await _bot_app.updater.stop()
         await _bot_app.stop()
         await _bot_app.shutdown()
+    await shutdown_scraper()
     await close_pool()
 
 
