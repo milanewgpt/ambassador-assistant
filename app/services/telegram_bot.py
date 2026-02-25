@@ -338,7 +338,7 @@ async def cmd_score_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Scoring in progress …")
 
-    ok = await score_post(post["id"])
+    ok = await score_post(post["id"], force=True)
     if ok:
         row = await fetch_one("SELECT portfolio_score FROM posts WHERE id = $1;", post["id"])
         await update.message.reply_text(f"✅ Scored! portfolio_score = {row['portfolio_score']}")
@@ -566,7 +566,7 @@ async def cmd_reclassify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("All posts are already classified.")
 
     msg = await update.message.reply_text(
-        f"⚙️ Re-classifying {count} unlinked posts …"
+        f"⚙️ Re-classifying {count} unlinked posts (rules mode) …"
     )
 
     rows = await fetch_all(

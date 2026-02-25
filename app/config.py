@@ -20,9 +20,12 @@ class Settings:
 
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     SCORING_MODEL: str = os.getenv("SCORING_MODEL", "openai/gpt-4o")
+    SCORING_MODE: str = os.getenv("SCORING_MODE", "llm")
 
     MAIN_X_HANDLE: str = os.getenv("MAIN_X_HANDLE", "")
     METRICS_MODE: str = os.getenv("METRICS_MODE", "manual")
+    CLASSIFICATION_MODE: str = os.getenv("CLASSIFICATION_MODE", "rules")
+    AUTO_CREATE_PROJECTS: bool = os.getenv("AUTO_CREATE_PROJECTS", "true").lower() in {"1", "true", "yes", "on"}
 
     INGEST_SHARED_SECRET: str = os.getenv("INGEST_SHARED_SECRET", "change-me")
 

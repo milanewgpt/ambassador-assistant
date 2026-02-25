@@ -86,6 +86,15 @@ async def process_due_jobs():
             attempts, job_id,
         )
 
+        already_scored = await fetch_one(
+            "SELECT post_id FROM llm_scores WHERE post_id = $1;",
+            post_id,
+        )
+        if already_scored:
+            await execute("UPDATE score_jobs SET status = 'done' WHERE id = $1;", job_id)
+            log.info("Job %s marked done: post already has llm_scores.", job_id)
+            continue
+
         has_metrics = await fetch_one(
             "SELECT id FROM metrics_snapshots WHERE post_id = $1 LIMIT 1;",
             post_id,

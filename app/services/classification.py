@@ -1,17 +1,17 @@
 """
-Project classification — cascade:
+Project classification — rule-based cascade:
   1. Handle match (existing projects)
   2. Keyword match >=2 hits (existing projects)
-  3. LLM: identify project from text → match existing OR auto-create new
+  3. Explicit token extraction (@handle, $TICKER, #hashtag)
+No LLM calls in classification path.
 """
 
-import json
 import re
 from uuid import UUID
 from typing import Optional
 
+from app.config import settings
 from app.database import fetch_all, fetch_one, fetch_val
-from app.services.scoring import call_openrouter
 from app.utils.logging import log
 
 
@@ -24,7 +24,7 @@ async def _all_projects() -> list[dict]:
 
 
 async def classify_post(url: str, text: str | None) -> Optional[UUID]:
-    """Classify a post by handle, keyword, or LLM. Auto-creates projects."""
+    """Classify a post with deterministic rules. No LLM fallback."""
     projects = await _all_projects()
     url_lower = (url or "").lower()
     text_lower = (text or "").lower()
@@ -44,12 +44,8 @@ async def classify_post(url: str, text: str | None) -> Optional[UUID]:
             log.info("Classified by keywords (%d hits) -> '%s'", hits, p["name"])
             return p["id"]
 
-    # 3) LLM — identify project, match or create
-    if text and len(text.strip()) > 20:
-        return await _llm_classify_or_create(text, projects)
-
-    # 4) Extract mentions from URL/text as last resort
-    return await _extract_and_create(combined, projects)
+    # 3) Explicit token extraction from text/URL
+    return await _extract_match_or_create(combined, projects)
 
 
 async def classify_signal(server: str, channel: str) -> Optional[UUID]:
@@ -90,88 +86,69 @@ async def _find_or_create_project(name: str, handles: list[str] = None, keywords
     return new_id
 
 
-async def _llm_classify_or_create(text: str, projects: list[dict]) -> Optional[UUID]:
+def _normalize_name(token: str) -> str:
+    if token.isupper() and len(token) <= 8:
+        return token
+    return token.capitalize()
+
+
+def _extract_candidate_tokens(combined_text: str) -> list[tuple[str, str]]:
     """
-    Ask LLM to identify the crypto/Web3 project from post text.
-    If the project exists — return its ID.
-    If not — create it and return the new ID.
+    Return explicit candidate tokens in priority order:
+    mention -> cashtag -> hashtag.
+    Each token is returned as (kind, token_without_prefix).
     """
-    try:
-        existing_names = [p["name"] for p in projects] if projects else []
-        existing_hint = f"\nAlready known projects: {json.dumps(existing_names)}" if existing_names else ""
+    mentions = re.findall(r'@([A-Za-z0-9_]{2,30})', combined_text)
+    cashtags = re.findall(r'\$([A-Za-z][A-Za-z0-9_]{1,15})', combined_text)
+    hashtags = re.findall(r'#([A-Za-z][A-Za-z0-9_]{1,30})', combined_text)
 
-        prompt = (
-            "You are a crypto/Web3 content classifier.\n"
-            "Identify the MAIN project or protocol this post is about.\n\n"
-            f"Post text: {text[:2000]}\n"
-            f"{existing_hint}\n\n"
-            "Rules:\n"
-            "- Return the project/protocol name (e.g. 'Solana', 'Uniswap', 'Arbitrum')\n"
-            "- If the post matches a known project, use EXACTLY that name\n"
-            "- If it's a new project not in the list, give its proper name\n"
-            "- If the post is generic crypto talk not about a specific project, return null\n"
-            "- Include the project's Twitter handle if you know it\n\n"
-            "Respond ONLY with JSON:\n"
-            '{"project": "<name or null>", "handle": "<twitter_handle or null>", '
-            '"keywords": ["keyword1", "keyword2"], "confidence": 0.0-1.0}'
-        )
+    tokens: list[tuple[str, str]] = []
+    for m in mentions:
+        tokens.append(("mention", m))
+    for c in cashtags:
+        tokens.append(("cashtag", c))
+    for h in hashtags:
+        tokens.append(("hashtag", h))
+    return tokens
 
-        raw = await call_openrouter(prompt, max_tokens=150)
-        match = re.search(r'\{[^}]+\}', raw)
-        if not match:
-            return None
 
-        data = json.loads(match.group())
-        confidence = float(data.get("confidence", 0))
-        proj_name = data.get("project")
-
-        if confidence < 0.6 or not proj_name or proj_name == "null":
-            log.info("LLM: no specific project (confidence=%.2f)", confidence)
-            return None
-
-        proj_name = proj_name.strip()
-        handles = []
-        if data.get("handle") and data["handle"] != "null":
-            handles = [data["handle"].lstrip("@")]
-        keywords = [k for k in (data.get("keywords") or []) if k and k != "null"]
-
-        # Try to match existing project
-        for p in projects:
-            if p["name"].lower() == proj_name.lower():
-                log.info("LLM matched existing project '%s' (%.2f)", p["name"], confidence)
-                return p["id"]
-
-        # Auto-create new project
-        new_id = await _find_or_create_project(proj_name, handles, keywords)
-        log.info("LLM -> new project '%s' (confidence=%.2f)", proj_name, confidence)
-        return new_id
-
-    except Exception as exc:
-        log.warning("LLM classification failed: %s", exc)
+async def _extract_match_or_create(combined_text: str, projects: list[dict]) -> Optional[UUID]:
+    """
+    Extract explicit project tokens (@, $, #), then match existing or optionally create.
+    """
+    if settings.CLASSIFICATION_MODE.lower() != "rules":
+        # In simplified mode we only support deterministic classification.
         return None
 
-
-async def _extract_and_create(combined_text: str, projects: list[dict]) -> Optional[UUID]:
-    """
-    Last resort: extract @mentions from text/URL and try to match or create.
-    Only creates if a clear single mention is found.
-    """
-    mentions = re.findall(r'@(\w{2,30})', combined_text)
-    if not mentions:
-        return None
-
-    from app.config import settings
     own_handle = settings.MAIN_X_HANDLE.lower().lstrip("@")
-    mentions = [m for m in mentions if m.lower() != own_handle]
-
-    if not mentions:
+    stop_tokens = {"crypto", "web3", "nft", "defi", "airdrop", "giveaway", "thread"}
+    candidates = _extract_candidate_tokens(combined_text)
+    if not candidates:
         return None
 
-    target = mentions[0]
+    seen: set[str] = set()
+    for kind, token in candidates:
+        t = token.lower()
+        if t in seen or t == own_handle or t in stop_tokens:
+            continue
+        seen.add(t)
 
-    for p in projects:
-        for h in (p["handles"] or []):
-            if h.lower() == target.lower():
+        # Existing match by handles or exact project name
+        for p in projects:
+            if p["name"].lower() == t:
                 return p["id"]
+            for h in (p["handles"] or []):
+                if h.lower() == t:
+                    return p["id"]
+
+        if not settings.AUTO_CREATE_PROJECTS:
+            continue
+
+        if kind == "mention":
+            return await _find_or_create_project(_normalize_name(token), handles=[token], keywords=[token.lower()])
+        if kind == "cashtag":
+            return await _find_or_create_project(_normalize_name(token.upper()), handles=[], keywords=[token.lower()])
+        if kind == "hashtag":
+            return await _find_or_create_project(_normalize_name(token), handles=[], keywords=[token.lower()])
 
     return None

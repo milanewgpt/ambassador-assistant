@@ -72,7 +72,7 @@ def _build_scoring_prompt(
     return "\n".join(parts)
 
 
-async def score_post(post_id: str) -> bool:
+async def score_post(post_id: str, force: bool = False) -> bool:
     """
     Run LLM scoring for a post. Returns True on success.
     Expects metrics to already exist (or proceeds without).
@@ -81,6 +81,15 @@ async def score_post(post_id: str) -> bool:
     if not post:
         log.error("score_post: post %s not found", post_id)
         return False
+
+    if settings.SCORING_MODE.lower() != "llm":
+        log.warning("SCORING_MODE=%s is not supported yet", settings.SCORING_MODE)
+        return False
+
+    existing_score = await fetch_one("SELECT post_id FROM llm_scores WHERE post_id = $1;", post_id)
+    if existing_score and not force:
+        log.info("Post %s already scored, skipping (force=%s)", post_id, force)
+        return True
 
     project_context = None
     if post["project_id"]:

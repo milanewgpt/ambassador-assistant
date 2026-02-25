@@ -33,6 +33,12 @@ OpenRouter, and managing everything through a Telegram bot.
 └──────────────────────────────────────────────────┘
 ```
 
+### Runtime Notes (lightweight mode)
+
+- Classification is **rule-based** (`handle + keywords + explicit @/$/# tokens`), no LLM call.
+- LLM is used only for **final post scoring** (normally one call per post).
+- Discord relay remains in the codebase as optional and can be extended later.
+
 ## Repository Structure
 
 ```
@@ -137,6 +143,9 @@ Key settings:
 - `OPENROUTER_API_KEY`
 - `MAIN_X_HANDLE` — your X handle without the `@`
 - `INGEST_SHARED_SECRET` — random string, must match PAD flows
+- `CLASSIFICATION_MODE` — `rules` (recommended)
+- `AUTO_CREATE_PROJECTS` — `true|false` for token-based auto creation
+- `SCORING_MODE` — `llm` (current supported mode)
 
 ---
 
@@ -267,7 +276,22 @@ docker compose up -d nginx
 
 1. Download your archive from X → Settings → Your Account → Download an archive of your data.
 2. Wait for the email, download the ZIP.
-3. Run:
+3. Use one of these import methods:
+
+### A) Telegram bot (simple)
+
+- Extract and send `data/tweets.js` to the bot (best for smaller files).
+- For files bigger than Telegram bot limits, use method B.
+
+### B) HTTP endpoint (large files)
+
+```bash
+curl -X POST http://YOUR_HOST:8000/ingest/archive \
+  -H "X-Shared-Secret: YOUR_INGEST_SHARED_SECRET" \
+  -F "file=@/path/to/twitter-archive.zip"
+```
+
+### C) CLI importer
 
 ```bash
 # Windows
@@ -277,8 +301,8 @@ python -m importer.x_archive --archive "C:\path\to\twitter-archive.zip"
 docker compose exec api python -m importer.x_archive --archive /path/to/archive.zip
 ```
 
-This parses all tweets, inserts them as `source='x_archive'`, classifies by project,
-and schedules scoring jobs.
+All methods parse tweets, insert them as `source='x_archive'`, classify by rules,
+and schedule scoring jobs.
 
 ---
 
@@ -325,15 +349,14 @@ Power Automate Desktop requires OneDrive to save flows. Before creating flows:
 
 ## Scoring Pipeline
 
-1. Post is ingested via `/ingest/x` (or imported from archive).
-2. A `score_jobs` row is created with `run_at = created_at + 48 hours`.
-3. Worker polls every 5 minutes for due jobs.
-4. If metrics are missing (manual mode), bot asks you via Telegram. Job enters `waiting_metrics`.
-5. You provide metrics via `/metrics <url> ...`. Job transitions back to `scheduled`.
-6. Worker picks up the job, calls OpenRouter for LLM scoring.
-7. LLM returns structured JSON: summary, tags, quality, relevance, blurb, risk_framing, specificity.
-8. Portfolio score is computed: `0.45*quality + 0.20*relevance + 0.25*engagement + 0.10*recency`.
-9. Results stored in `llm_scores` and `portfolio_score` updated on the post.
+1. Post is ingested (Telegram link, archive import, or `/ingest/x`).
+2. Project classification runs in deterministic **rules mode** (no LLM).
+3. A `score_jobs` row is created with `run_at = created_at + 48 hours`.
+4. Worker polls every 5 minutes for due jobs.
+5. Worker tries to auto-scrape metrics; if missing for new posts, bot asks via Telegram and sets `waiting_metrics`.
+6. User can provide metrics via `/metrics <url> ...`, job returns to `scheduled`.
+7. Worker runs **one LLM scoring call** for unscored posts.
+8. Results are stored in `llm_scores`, then `portfolio_score` is updated on `posts`.
 
 ---
 
