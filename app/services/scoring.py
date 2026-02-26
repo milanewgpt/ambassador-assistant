@@ -17,8 +17,38 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def _extract_assistant_content(data: dict) -> str:
-    """Extract assistant text from common OpenAI-compatible responses."""
-    return data["choices"][0]["message"]["content"]
+    """
+    Extract assistant text from OpenAI-compatible and near-compatible responses.
+    Supports:
+    - choices[0].message.content (string)
+    - choices[0].message.content ([{"type":"text","text":"..."}])
+    - choices[0].text
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError(f"No choices in LLM response: keys={list(data.keys())[:10]}")
+
+    choice0 = choices[0] or {}
+    message = choice0.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = item.get("text")
+                    if isinstance(txt, str) and txt:
+                        parts.append(txt)
+            if parts:
+                return "\n".join(parts)
+
+    text = choice0.get("text")
+    if isinstance(text, str):
+        return text
+
+    raise ValueError(f"Unsupported LLM response shape: {str(data)[:400]}")
 
 
 async def _call_openrouter(prompt: str, max_tokens: int = 800) -> str:
