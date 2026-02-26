@@ -65,7 +65,13 @@ async def process_due_jobs():
         FROM score_jobs sj
         JOIN posts p ON p.id = sj.post_id
         WHERE sj.status = 'scheduled' AND sj.run_at <= $1
-        ORDER BY sj.run_at
+        ORDER BY
+            CASE
+                WHEN p.source = 'x_relay' THEN 0
+                WHEN p.source = 'manual' THEN 1
+                ELSE 2
+            END,
+            sj.run_at
         LIMIT 10;
         """,
         now,
