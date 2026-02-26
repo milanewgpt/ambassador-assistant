@@ -24,9 +24,16 @@ def _extract_assistant_content(data: dict) -> str:
     - choices[0].message.content ([{"type":"text","text":"..."}])
     - choices[0].text
     """
-    choices = data.get("choices") or []
-    if not choices:
+    raw_choices = data.get("choices")
+    if raw_choices is None or raw_choices == []:
+        base_resp = data.get("base_resp") or {}
+        status_msg = base_resp.get("status_msg")
+        status_code = base_resp.get("status_code")
+        if status_msg:
+            raise ValueError(f"Provider returned no choices ({status_code}): {status_msg}")
         raise ValueError(f"No choices in LLM response: keys={list(data.keys())[:10]}")
+
+    choices = raw_choices
 
     choice0 = choices[0] or {}
     message = choice0.get("message")
