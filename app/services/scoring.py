@@ -1,5 +1,5 @@
 """
-LLM scoring via OpenRouter + portfolio score computation.
+LLM scoring via provider (OpenRouter/MiniMax) + portfolio score computation.
 """
 
 import json
@@ -16,8 +16,13 @@ from app.utils.logging import log
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
-async def call_openrouter(prompt: str, max_tokens: int = 800) -> str:
-    """Raw call to OpenRouter. Returns the assistant content string."""
+def _extract_assistant_content(data: dict) -> str:
+    """Extract assistant text from common OpenAI-compatible responses."""
+    return data["choices"][0]["message"]["content"]
+
+
+async def _call_openrouter(prompt: str, max_tokens: int = 800) -> str:
+    """Raw call to OpenRouter. Returns assistant content."""
     headers = {
         "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -35,8 +40,48 @@ async def call_openrouter(prompt: str, max_tokens: int = 800) -> str:
         resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json()
+    return _extract_assistant_content(data)
 
-    return data["choices"][0]["message"]["content"]
+
+async def _call_minimax(prompt: str, max_tokens: int = 800) -> str:
+    """
+    MiniMax call using OpenAI-compatible format.
+    Endpoint and path are configurable via env.
+    """
+    if not settings.MINIMAX_API_KEY:
+        raise RuntimeError("MINIMAX_API_KEY is not configured")
+
+    base = settings.MINIMAX_BASE_URL.rstrip("/")
+    path = settings.MINIMAX_CHAT_PATH
+    if not path.startswith("/"):
+        path = f"/{path}"
+    url = f"{base}{path}"
+
+    headers = {
+        "Authorization": f"Bearer {settings.MINIMAX_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.SCORING_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    return _extract_assistant_content(data)
+
+
+async def call_llm(prompt: str, max_tokens: int = 800) -> str:
+    provider = settings.LLM_PROVIDER.lower().strip()
+    if provider == "openrouter":
+        return await _call_openrouter(prompt, max_tokens=max_tokens)
+    if provider == "minimax":
+        return await _call_minimax(prompt, max_tokens=max_tokens)
+    raise RuntimeError(f"Unsupported LLM_PROVIDER: {settings.LLM_PROVIDER}")
 
 
 def _build_scoring_prompt(
@@ -107,7 +152,7 @@ async def score_post(post_id: str, force: bool = False) -> bool:
     prompt = _build_scoring_prompt(post["text"], post["url"], project_context, metrics)
 
     try:
-        raw = await call_openrouter(prompt, max_tokens=600)
+        raw = await call_llm(prompt, max_tokens=600)
         match = re.search(r'\{[\s\S]*\}', raw)
         if not match:
             raise ValueError(f"No JSON found in LLM response: {raw[:200]}")

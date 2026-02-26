@@ -2,7 +2,7 @@
 
 End-to-end system for crypto/Web3 ambassador workflow automation: capturing
 Discord signals and X posts via Windows UI relay, scoring content with LLM via
-OpenRouter, and managing everything through a Telegram bot.
+a configurable provider (OpenRouter or MiniMax), and managing everything through a Telegram bot.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ ambassador-assistant/
 │   │   └── ingest.py       # POST /ingest/discord, /ingest/x
 │   ├── services/
 │   │   ├── classification.py  # Project classification cascade
-│   │   ├── scoring.py         # OpenRouter LLM scoring
+│   │   ├── scoring.py         # LLM scoring (OpenRouter/MiniMax)
 │   │   ├── notifications.py   # Telegram message sender
 │   │   └── telegram_bot.py    # Bot commands (/projects, /best, etc.)
 │   └── utils/
@@ -120,15 +120,30 @@ You can verify tables were created in **Supabase Studio** → Table Editor.
    TELEGRAM_CHAT_ID=123456789
    ```
 
-### 4. Get OpenRouter API Key
+### 4. Configure LLM Provider
 
-1. Go to <https://openrouter.ai/keys>.
-2. Create an API key and add credits.
-3. Set in `.env`:
-   ```
-   OPENROUTER_API_KEY=sk-or-v1-...
-   SCORING_MODEL=openai/gpt-4o
-   ```
+Choose one provider:
+
+- **OpenRouter**
+  1. Go to <https://openrouter.ai/keys>.
+  2. Create an API key and add credits.
+  3. Set:
+     ```
+     LLM_PROVIDER=openrouter
+     OPENROUTER_API_KEY=sk-or-v1-...
+     SCORING_MODEL=openai/gpt-4o
+     ```
+
+- **MiniMax**
+  1. Create API key in MiniMax dashboard.
+  2. Set:
+     ```
+     LLM_PROVIDER=minimax
+     MINIMAX_API_KEY=...
+     MINIMAX_BASE_URL=https://api.minimax.io/v1
+     MINIMAX_CHAT_PATH=/text/chatcompletion_v2
+     SCORING_MODEL=MiniMax-M2.5
+     ```
 
 ### 5. Configure Environment
 
@@ -140,7 +155,10 @@ cp .env.dev.example .env
 Key settings:
 - `DATABASE_URL` — Supabase Postgres connection string
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
-- `OPENROUTER_API_KEY`
+- `LLM_PROVIDER` — `openrouter` or `minimax`
+- `SCORING_MODEL` — model name for selected provider
+- `OPENROUTER_API_KEY` (if provider = openrouter)
+- `MINIMAX_API_KEY` + `MINIMAX_BASE_URL` + `MINIMAX_CHAT_PATH` (if provider = minimax)
 - `MAIN_X_HANDLE` — your X handle without the `@`
 - `INGEST_SHARED_SECRET` — random string, must match PAD flows
 - `CLASSIFICATION_MODE` — `rules` (recommended)
