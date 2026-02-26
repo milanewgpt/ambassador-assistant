@@ -142,16 +142,42 @@ def _build_scoring_prompt(
     parts.append(
         "\nReturn JSON with these exact keys:\n"
         "{\n"
-        '  "summary_en": "1-2 sentence summary in English",\n'
+        '  "summary_en": "max 220 chars, English",\n'
         '  "tags": ["thread"|"analysis"|"risk"|"tutorial"|"update"|"opinion", ...],\n'
         '  "quality": 0.0-1.0,\n'
         '  "relevance": 0.0-1.0,\n'
-        '  "portfolio_blurb_en": "1-2 line blurb suitable for ambassador forms",\n'
+        '  "portfolio_blurb_en": "max 180 chars, English",\n'
         '  "risk_framing": 0.0-1.0,\n'
         '  "specificity": 0.0-1.0\n'
-        "}"
+        "}\n"
+        "Rules: output ONLY JSON, no markdown, no explanation."
     )
     return "\n".join(parts)
+
+
+def _parse_score_result(raw: str) -> LLMScoreResult:
+    match = re.search(r"\{[\s\S]*\}", raw or "")
+    if not match:
+        raise ValueError(f"No JSON found in LLM response: {(raw or '')[:300]}")
+    return LLMScoreResult(**json.loads(match.group()))
+
+
+def _build_json_repair_prompt(raw: str) -> str:
+    return (
+        "Convert the following model output to STRICT valid JSON.\n"
+        "Keep original meaning, do not invent new facts.\n"
+        "Output ONLY JSON with keys:\n"
+        "{\n"
+        '  "summary_en": "string",\n'
+        '  "tags": ["thread|analysis|risk|tutorial|update|opinion"],\n'
+        '  "quality": 0.0-1.0,\n'
+        '  "relevance": 0.0-1.0,\n'
+        '  "portfolio_blurb_en": "string",\n'
+        '  "risk_framing": 0.0-1.0,\n'
+        '  "specificity": 0.0-1.0\n'
+        "}\n\n"
+        f"Raw output:\n{(raw or '')[:3000]}"
+    )
 
 
 async def score_post(post_id: str, force: bool = False) -> bool:
@@ -189,15 +215,22 @@ async def score_post(post_id: str, force: bool = False) -> bool:
     prompt = _build_scoring_prompt(post["text"], post["url"], project_context, metrics)
 
     try:
-        raw = await call_llm(prompt, max_tokens=600)
-        match = re.search(r'\{[\s\S]*\}', raw)
-        if not match:
-            raise ValueError(f"No JSON found in LLM response: {raw[:200]}")
-
-        result = LLMScoreResult(**json.loads(match.group()))
-    except Exception as exc:
-        log.error("LLM scoring failed for post %s: %s", post_id, exc)
-        return False
+        raw = await call_llm(prompt, max_tokens=900)
+        result = _parse_score_result(raw)
+    except Exception as first_exc:
+        log.warning("Primary JSON parse failed for post %s: %s", post_id, first_exc)
+        try:
+            repaired = await call_llm(_build_json_repair_prompt(raw), max_tokens=500)
+            result = _parse_score_result(repaired)
+            log.info("JSON repair succeeded for post %s", post_id)
+        except Exception as second_exc:
+            log.error(
+                "LLM scoring failed for post %s: primary=%s | repair=%s",
+                post_id,
+                first_exc,
+                second_exc,
+            )
+            return False
 
     await execute(
         """
