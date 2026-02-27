@@ -224,13 +224,9 @@ async def score_post(post_id: str, force: bool = False) -> bool:
             result = _parse_score_result(repaired)
             log.info("JSON repair succeeded for post %s", post_id)
         except Exception as second_exc:
-            log.error(
-                "LLM scoring failed for post %s: primary=%s | repair=%s",
-                post_id,
-                first_exc,
-                second_exc,
-            )
-            return False
+            msg = f"primary={first_exc} | repair={second_exc}"
+            log.error("LLM scoring failed for post %s: %s", post_id, msg)
+            raise RuntimeError(msg) from second_exc
 
     await execute(
         """

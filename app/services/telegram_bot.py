@@ -338,7 +338,11 @@ async def cmd_score_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Scoring in progress …")
 
-    ok = await score_post(post["id"], force=True)
+    try:
+        ok = await score_post(post["id"], force=True)
+    except Exception as exc:
+        log.error("Manual /score_now failed for %s: %s", url, exc)
+        return await update.message.reply_text(f"❌ Scoring failed: {exc}")
     if ok:
         row = await fetch_one("SELECT portfolio_score FROM posts WHERE id = $1;", post["id"])
         await update.message.reply_text(f"✅ Scored! portfolio_score = {row['portfolio_score']}")

@@ -72,9 +72,10 @@ async def process_due_jobs():
                 ELSE 2
             END,
             sj.run_at
-        LIMIT 10;
+        LIMIT $2;
         """,
         now,
+        settings.WORKER_BATCH_SIZE,
     )
 
     for job in due:
@@ -176,7 +177,11 @@ async def process_due_jobs():
 
 
 async def main_loop():
-    log.info("Worker starting — poll interval: %ds", settings.WORKER_POLL_SECONDS)
+    log.info(
+        "Worker starting — poll interval: %ds, batch size: %d",
+        settings.WORKER_POLL_SECONDS,
+        settings.WORKER_BATCH_SIZE,
+    )
     await get_pool()
 
     while RUNNING:
