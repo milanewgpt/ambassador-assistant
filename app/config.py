@@ -41,6 +41,7 @@ class Settings:
     SCORING_DELAY_HOURS: int = int(os.getenv("SCORING_DELAY_HOURS", "48"))
     WORKER_POLL_SECONDS: int = int(os.getenv("WORKER_POLL_SECONDS", "300"))
     WORKER_BATCH_SIZE: int = int(os.getenv("WORKER_BATCH_SIZE", "10"))
+    WORKER_CONCURRENCY: int = int(os.getenv("WORKER_CONCURRENCY", "3"))
 
 
 settings = Settings()

@@ -78,7 +78,7 @@ async def process_due_jobs():
         settings.WORKER_BATCH_SIZE,
     )
 
-    for job in due:
+    async def _process_one(job):
         job_id = job["id"]
         post_id = job["post_id"]
         post_url = job["url"]
@@ -100,7 +100,7 @@ async def process_due_jobs():
         if already_scored:
             await execute("UPDATE score_jobs SET status = 'done' WHERE id = $1;", job_id)
             log.info("Job %s marked done: post already has llm_scores.", job_id)
-            continue
+            return
 
         has_metrics = await fetch_one(
             "SELECT id FROM metrics_snapshots WHERE post_id = $1 LIMIT 1;",
@@ -128,7 +128,7 @@ async def process_due_jobs():
                     "UPDATE score_jobs SET status = 'waiting_metrics' WHERE id = $1;",
                     job_id,
                 )
-                continue
+                return
 
         # Run LLM scoring
         try:
@@ -158,6 +158,21 @@ async def process_due_jobs():
                     error_msg, job_id,
                 )
 
+    if due:
+        sem = asyncio.Semaphore(max(1, settings.WORKER_CONCURRENCY))
+
+        async def _run_with_limit(job):
+            async with sem:
+                await _process_one(job)
+
+        results = await asyncio.gather(
+            *(_run_with_limit(job) for job in due),
+            return_exceptions=True,
+        )
+        for res in results:
+            if isinstance(res, Exception):
+                log.error("Unhandled job task error: %s", res)
+
     # Nudge waiting_metrics jobs older than 4 hours
     stale = await fetch_all(
         """
@@ -178,9 +193,10 @@ async def process_due_jobs():
 
 async def main_loop():
     log.info(
-        "Worker starting — poll interval: %ds, batch size: %d",
+        "Worker starting — poll interval: %ds, batch size: %d, concurrency: %d",
         settings.WORKER_POLL_SECONDS,
         settings.WORKER_BATCH_SIZE,
+        settings.WORKER_CONCURRENCY,
     )
     await get_pool()
 
