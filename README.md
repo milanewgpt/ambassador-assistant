@@ -159,6 +159,7 @@ Key settings:
 - `SCORING_MODEL` — model name for selected provider
 - `OPENROUTER_API_KEY` (if provider = openrouter)
 - `MINIMAX_API_KEY` + `MINIMAX_BASE_URL` + `MINIMAX_CHAT_PATH` (if provider = minimax)
+- `SOCIALDATA_API_KEY` + `SOCIALDATA_BASE_URL` (optional, used for tweet text/metrics before scraper fallback)
 - `MAIN_X_HANDLE` — your X handle without the `@`
 - `INGEST_SHARED_SECRET` — random string, must match PAD flows
 - `CLASSIFICATION_MODE` — `rules` (recommended)
@@ -371,7 +372,7 @@ Power Automate Desktop requires OneDrive to save flows. Before creating flows:
 2. Project classification runs in deterministic **rules mode** (no LLM).
 3. A `score_jobs` row is created with `run_at = created_at + 48 hours`.
 4. Worker polls every 5 minutes for due jobs.
-5. Worker tries to auto-scrape metrics; if missing for new posts, bot asks via Telegram and sets `waiting_metrics`.
+5. Worker tries to fetch metrics via SocialData API first, then falls back to browser scraping; if still missing for new posts, bot asks via Telegram and sets `waiting_metrics`.
 6. User can provide metrics via `/metrics <url> ...`, job returns to `scheduled`.
 7. Worker runs **one LLM scoring call** for unscored posts.
 8. Results are stored in `llm_scores`, then `portfolio_score` is updated on `posts`.

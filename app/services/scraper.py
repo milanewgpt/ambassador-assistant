@@ -8,7 +8,9 @@ import os
 import re
 import time
 from dataclasses import dataclass
+import httpx
 from playwright.async_api import async_playwright, TimeoutError as PwTimeout
+from app.config import settings
 from app.utils.logging import log
 
 _METRICS_TIMEOUT_MS = 15_000
@@ -35,6 +37,75 @@ class ScrapedMetrics:
     reposts: int = 0
     quotes: int = 0
     views: int = 0
+
+
+def _extract_tweet_id(url: str) -> str | None:
+    m = re.search(r"/status/(\d+)", url or "")
+    return m.group(1) if m else None
+
+
+def _socialdata_pick_int(data: dict, keys: list[str]) -> int:
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    return 0
+
+
+def _socialdata_extract_tweet_payload(data: dict) -> dict:
+    """
+    SocialData may return tweet fields at top-level or under 'tweet' / 'data'.
+    """
+    if isinstance(data.get("tweet"), dict):
+        return data["tweet"]
+    if isinstance(data.get("data"), dict):
+        return data["data"]
+    return data
+
+
+async def _socialdata_get_tweet(url: str) -> dict | None:
+    if not settings.SOCIALDATA_API_KEY:
+        return None
+
+    tweet_id = _extract_tweet_id(url)
+    if not tweet_id:
+        return None
+
+    endpoint = f"{settings.SOCIALDATA_BASE_URL.rstrip('/')}/twitter/tweets/{tweet_id}"
+    headers = {
+        "Authorization": f"Bearer {settings.SOCIALDATA_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(endpoint, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return _socialdata_extract_tweet_payload(data)
+    except Exception as exc:
+        log.warning("SocialData fetch failed for %s: %s", url, exc)
+        return None
+
+
+def _socialdata_text(tweet: dict) -> str | None:
+    for k in ("full_text", "text", "tweet_text"):
+        v = tweet.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _socialdata_metrics(tweet: dict) -> ScrapedMetrics:
+    return ScrapedMetrics(
+        likes=_socialdata_pick_int(tweet, ["favorite_count", "like_count", "likes"]),
+        replies=_socialdata_pick_int(tweet, ["reply_count", "replies"]),
+        reposts=_socialdata_pick_int(tweet, ["retweet_count", "repost_count", "reposts"]),
+        quotes=_socialdata_pick_int(tweet, ["quote_count", "quotes"]),
+        views=_socialdata_pick_int(tweet, ["view_count", "views", "impression_count"]),
+    )
 
 
 def _parse_count(text: str) -> int:
@@ -195,6 +266,13 @@ async def scrape_post_text(url: str) -> str | None:
     Open a tweet URL in headless Chromium and extract the tweet text.
     Returns the text or None on failure.
     """
+    social = await _socialdata_get_tweet(url)
+    if social:
+        text = _socialdata_text(social)
+        if text:
+            log.info("SocialData text fetched (%d chars) for %s", len(text), url)
+            return text
+
     log.info("Scraping text for: %s", url)
     try:
         async def _fn(page):
@@ -236,6 +314,15 @@ async def scrape_post_metrics(url: str) -> ScrapedMetrics | None:
     Open a tweet URL in headless Chromium and scrape engagement metrics.
     Returns ScrapedMetrics on success, None on failure.
     """
+    social = await _socialdata_get_tweet(url)
+    if social:
+        metrics = _socialdata_metrics(social)
+        log.info(
+            "SocialData metrics %s: likes=%d replies=%d reposts=%d quotes=%d views=%d",
+            url, metrics.likes, metrics.replies, metrics.reposts, metrics.quotes, metrics.views
+        )
+        return metrics
+
     log.info("Scraping metrics for: %s", url)
 
     try:

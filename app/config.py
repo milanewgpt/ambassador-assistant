@@ -20,6 +20,8 @@ class Settings:
 
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     MINIMAX_API_KEY: str = os.getenv("MINIMAX_API_KEY", "")
+    SOCIALDATA_API_KEY: str = os.getenv("SOCIALDATA_API_KEY", "")
+    SOCIALDATA_BASE_URL: str = os.getenv("SOCIALDATA_BASE_URL", "https://api.socialdata.tools")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openrouter")
     MINIMAX_BASE_URL: str = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
     MINIMAX_CHAT_PATH: str = os.getenv("MINIMAX_CHAT_PATH", "/text/chatcompletion_v2")

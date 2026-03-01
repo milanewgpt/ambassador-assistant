@@ -34,7 +34,7 @@ async def _try_scrape_and_save(post_id, url: str) -> bool:
     """Attempt to scrape metrics via headless browser. Returns True if saved."""
     try:
         metrics = await scrape_post_metrics(url)
-        if metrics and (metrics.likes or metrics.replies or metrics.reposts or metrics.views):
+        if metrics is not None:
             await execute(
                 """
                 INSERT INTO metrics_snapshots (post_id, likes, replies, reposts, quotes, views)
