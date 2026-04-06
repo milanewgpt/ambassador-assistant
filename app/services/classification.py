@@ -1,8 +1,8 @@
 """
 Project classification — rule-based cascade:
-  1. Handle match (existing projects)
-  2. Keyword match >=2 hits (existing projects)
-  3. Explicit token extraction (@handle, $TICKER, #hashtag)
+  1. Explicit token extraction from post text (@handle, $TICKER, #hashtag)
+  2. Handle/token match in URL
+  3. Keyword match >=2 hits (existing projects)
 No LLM calls in classification path.
 """
 
@@ -30,22 +30,33 @@ async def classify_post(url: str, text: str | None) -> Optional[UUID]:
     text_lower = (text or "").lower()
     combined = f"{url_lower} {text_lower}"
 
-    # 1) Handle match
+    # 1) Explicit token extraction from post text (highest priority)
+    by_text_token = await _extract_match_or_create(text_lower, projects)
+    if by_text_token:
+        log.info("Classified by explicit token in post text")
+        return by_text_token
+
+    # 2) Handle match in URL
     for p in projects:
         for h in (p["handles"] or []):
             if h.lower() in url_lower:
-                log.info("Classified by handle '%s' -> '%s'", h, p["name"])
+                log.info("Classified by URL handle '%s' -> '%s'", h, p["name"])
                 return p["id"]
 
-    # 2) Keyword match (>=2 hits)
+    # 2b) Explicit token extraction from URL (fallback inside URL stage)
+    by_url_token = await _extract_match_or_create(url_lower, projects)
+    if by_url_token:
+        log.info("Classified by explicit token in URL")
+        return by_url_token
+
+    # 3) Keyword match (>=2 hits) as final fallback
     for p in projects:
         hits = sum(1 for kw in (p["keywords"] or []) if kw.lower() in combined)
         if hits >= 2:
             log.info("Classified by keywords (%d hits) -> '%s'", hits, p["name"])
             return p["id"]
 
-    # 3) Explicit token extraction from text/URL
-    return await _extract_match_or_create(combined, projects)
+    return None
 
 
 async def classify_signal(server: str, channel: str) -> Optional[UUID]:
