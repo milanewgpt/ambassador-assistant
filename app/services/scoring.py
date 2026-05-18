@@ -2,6 +2,7 @@
 LLM scoring via provider (OpenRouter/MiniMax) + portfolio score computation.
 """
 
+import asyncio
 import json
 import re
 import math
@@ -59,25 +60,49 @@ def _extract_assistant_content(data: dict) -> str:
 
 
 async def _call_openrouter(prompt: str, max_tokens: int = 800) -> str:
-    """Raw call to OpenRouter. Returns assistant content."""
+    """Call OpenRouter, auto-falling back through SCORING_MODEL_FALLBACKS on 404/429."""
     headers = {
         "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://ambassador-assistant.local",
         "X-Title": "Ambassador Assistant",
     }
-    payload = {
-        "model": settings.SCORING_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0.2,
-    }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-    return _extract_assistant_content(data)
+    models = [settings.SCORING_MODEL] + settings.SCORING_MODEL_FALLBACKS
+    last_exc: Exception | None = None
+
+    for model in models:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.2,
+        }
+        for attempt in range(4):
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+            if resp.status_code == 429:
+                wait = 15 * (attempt + 1)
+                log.warning("OpenRouter 429 on %s, retrying in %ds (%d/4)...", model, wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code == 404:
+                log.warning("OpenRouter 404 on %s — trying next model", model)
+                last_exc = httpx.HTTPStatusError(f"404 {model}", request=resp.request, response=resp)
+                break
+            try:
+                resp.raise_for_status()
+                result = _extract_assistant_content(resp.json())
+                if model != settings.SCORING_MODEL:
+                    log.info("Used fallback model: %s", model)
+                return result
+            except Exception as exc:
+                last_exc = exc
+                break
+        else:
+            last_exc = httpx.HTTPStatusError(f"429 rate limit exhausted on {model}", request=resp.request, response=resp)
+
+    raise last_exc or RuntimeError("All OpenRouter models failed")
 
 
 async def _call_minimax(prompt: str, max_tokens: int = 800) -> str:
@@ -216,15 +241,20 @@ async def score_post(post_id: str, force: bool = False) -> bool:
 
     try:
         raw = await call_llm(prompt, max_tokens=900)
+    except Exception as call_exc:
+        log.error("LLM call failed for post %s: %s", post_id, call_exc)
+        raise
+
+    try:
         result = _parse_score_result(raw)
-    except Exception as first_exc:
-        log.warning("Primary JSON parse failed for post %s: %s", post_id, first_exc)
+    except Exception as parse_exc:
+        log.warning("Primary JSON parse failed for post %s: %s", post_id, parse_exc)
         try:
             repaired = await call_llm(_build_json_repair_prompt(raw), max_tokens=500)
             result = _parse_score_result(repaired)
             log.info("JSON repair succeeded for post %s", post_id)
         except Exception as second_exc:
-            msg = f"primary={first_exc} | repair={second_exc}"
+            msg = f"primary={parse_exc} | repair={second_exc}"
             log.error("LLM scoring failed for post %s: %s", post_id, msg)
             raise RuntimeError(msg) from second_exc
 

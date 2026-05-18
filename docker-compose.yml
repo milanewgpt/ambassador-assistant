@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     init: true
     ports:
-      - "8002:8000"
+      - "127.0.0.1:8002:8000"
     env_file:
       - .env
     dns:
@@ -33,20 +33,5 @@ services:
     volumes:
       - ./logs:/opt/ambassador/logs
     command: python -m worker.scheduler
-    depends_on:
-      - api
-
-  nginx:
-    image: nginx:alpine
-    container_name: amb-nginx
-    restart: unless-stopped
-    init: true
-    ports:
-      - "8080:80"
-      - "8443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./certbot/conf:/etc/letsencrypt:ro
-      - ./certbot/www:/var/www/certbot:ro
     depends_on:
       - api

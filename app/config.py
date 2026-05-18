@@ -26,6 +26,9 @@ class Settings:
     MINIMAX_BASE_URL: str = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1")
     MINIMAX_CHAT_PATH: str = os.getenv("MINIMAX_CHAT_PATH", "/text/chatcompletion_v2")
     SCORING_MODEL: str = os.getenv("SCORING_MODEL", "openai/gpt-4o")
+    SCORING_MODEL_FALLBACKS: list[str] = [
+        m.strip() for m in os.getenv("SCORING_MODEL_FALLBACKS", "").split(",") if m.strip()
+    ]
     SCORING_MODE: str = os.getenv("SCORING_MODE", "llm")
 
     MAIN_X_HANDLE: str = os.getenv("MAIN_X_HANDLE", "")
